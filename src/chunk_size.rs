@@ -59,8 +59,8 @@ enum ChunkCapacityErrorRepr {
 /// higher semantic level when determining the chunk.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ChunkCapacity {
-    desired: usize,
-    max: usize,
+    pub(crate) desired: usize,
+    pub(crate) max: usize,
 }
 
 impl ChunkCapacity {
@@ -130,13 +130,6 @@ impl ChunkCapacity {
             Ordering::Equal
         }
     }
-
-    /// Generates a chunk size object based on the size provided from a sizer
-    /// Calculates and stores whether or not it fits within the capacity
-    #[must_use]
-    fn chunk_size(&self, size: usize) -> ChunkSize {
-        ChunkSize::new(self.fits(size), size)
-    }
 }
 
 impl From<usize> for ChunkCapacity {
@@ -193,36 +186,6 @@ impl From<RangeToInclusive<usize>> for ChunkCapacity {
     }
 }
 
-/// Result returned from a `ChunkSizer`. Includes the size of the chunk, in units
-/// determined by the sizer, as well as the max byte offset of the text that
-/// would fit within the given `ChunkCapacity`.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct ChunkSize {
-    /// Whether or not the entire chunk fits within the `ChunkCapacity`
-    fits: Ordering,
-    /// Size of the chunk, in units used by the sizer.
-    size: usize,
-}
-
-impl ChunkSize {
-    #[must_use]
-    pub fn new(fits: Ordering, size: usize) -> Self {
-        Self { fits, size }
-    }
-
-    /// Determine whether the chunk size fits within the capacity or not
-    #[must_use]
-    pub fn fits(&self) -> Ordering {
-        self.fits
-    }
-
-    /// Size of the chunk, in units used by the sizer.
-    #[must_use]
-    pub fn size(&self) -> usize {
-        self.size
-    }
-}
-
 /// Determines the size of a given chunk.
 pub trait ChunkSizer {
     /// Determine the size of a given chunk to use for validation
@@ -250,13 +213,13 @@ where
     Sizer: ChunkSizer,
 {
     /// The chunk capacity to use for filling chunks
-    capacity: ChunkCapacity,
+    pub(crate) capacity: ChunkCapacity,
     /// The amount of overlap between chunks. Defaults to 0.
-    overlap: usize,
+    pub(crate) overlap: usize,
     /// The chunk sizer to use for determining the size of each chunk
-    sizer: Sizer,
+    pub(crate) sizer: Sizer,
     /// Whether whitespace will be trimmed from the beginning and end of each chunk
-    trim: bool,
+    pub(crate) trim: bool,
 }
 
 impl ChunkConfig<Characters> {
@@ -372,13 +335,9 @@ where
     Sizer: ChunkSizer,
 {
     /// Cache of chunk sizes per byte offset range for base capacity
-    capacity_cache: AHashMap<Range<usize>, ChunkSize>,
-    /// The configuration for the chunk sizer
-    chunk_config: &'sizer ChunkConfig<Sizer>,
-    /// Cache of chunk sizes per byte offset range for overlap ranges
-    overlap_cache: AHashMap<Range<usize>, ChunkSize>,
-    /// Semantic level, used for determining trimming behavior
-    trim: Trim,
+    size_cache: AHashMap<Range<usize>, usize>,
+    /// The sizer used for caluclating chunk sizes
+    sizer: &'sizer Sizer,
 }
 
 impl<'sizer, Sizer> MemoizedChunkSizer<'sizer, Sizer>
@@ -386,58 +345,33 @@ where
     Sizer: ChunkSizer,
 {
     /// Wrap any chunk sizer for memoization
-    pub fn new(chunk_config: &'sizer ChunkConfig<Sizer>, trim: Trim) -> Self {
+    pub fn new(sizer: &'sizer Sizer) -> Self {
         Self {
-            capacity_cache: AHashMap::new(),
-            chunk_config,
-            overlap_cache: AHashMap::new(),
-            trim,
+            size_cache: AHashMap::new(),
+            sizer,
         }
     }
 
     /// Determine the size of a given chunk to use for validation,
     /// returning a cached value if it exists, and storing the result if not.
-    fn chunk_size(&mut self, offset: usize, chunk: &str, is_overlap: bool) -> ChunkSize {
-        let cache = if is_overlap {
-            &mut self.overlap_cache
-        } else {
-            &mut self.capacity_cache
-        };
-        let capacity = if is_overlap {
-            self.chunk_config.overlap.into()
-        } else {
-            self.chunk_config.capacity
-        };
-
-        *cache
+    pub fn chunk_size(&mut self, offset: usize, chunk: &str, trim: Trim) -> usize {
+        let (offset, chunk) = trim.trim(offset, chunk);
+        *self
+            .size_cache
             .entry(offset..(offset + chunk.len()))
-            .or_insert_with(|| capacity.chunk_size(self.chunk_config.sizer.size(chunk)))
-    }
-
-    /// Check if the chunk is within the capacity. Chunk should be trimmed if necessary beforehand.
-    pub fn check_capacity(&mut self, offset: usize, chunk: &str, is_overlap: bool) -> ChunkSize {
-        let (offset, chunk) = self.trim_chunk(offset, chunk);
-        self.chunk_size(offset, chunk, is_overlap)
-    }
-
-    /// If trim chunks is on, trim the str and adjust the offset
-    pub fn trim_chunk<'text>(&self, offset: usize, chunk: &'text str) -> (usize, &'text str) {
-        if self.chunk_config.trim {
-            self.trim.trim(offset, chunk)
-        } else {
-            (offset, chunk)
-        }
+            .or_insert_with(|| self.sizer.size(chunk))
     }
 
     /// Find the best level to start splitting the text
     pub fn find_correct_level<'text, L: fmt::Debug>(
         &mut self,
         offset: usize,
+        capacity: &ChunkCapacity,
         levels_with_first_chunk: impl Iterator<Item = (L, &'text str)>,
+        trim: Trim,
     ) -> (Option<L>, Option<usize>) {
         let mut semantic_level = None;
         let mut max_offset = None;
-        let max_size = self.chunk_config.capacity.max;
 
         // We assume that larger levels are also longer. We can skip lower levels if going to a higher level would result in a shorter text
         let levels_with_first_chunk =
@@ -452,10 +386,11 @@ where
         for (level, str) in levels_with_first_chunk {
             // Skip tokenizing levels that we know are too small anyway.
             let len = str.len();
-            if len > max_size {
-                let chunk_size = self.check_capacity(offset, str, false);
+            if len > capacity.max {
+                let chunk_size = self.chunk_size(offset, str, trim);
+                let fits = capacity.fits(chunk_size);
                 // If this no longer fits, we use the level we are at.
-                if chunk_size.fits.is_gt() {
+                if fits.is_gt() {
                     max_offset = Some(offset + len);
                     break;
                 }
@@ -470,8 +405,7 @@ where
     /// Clear the cached values. Once we've moved the cursor,
     /// we don't need to keep the old values around.
     pub fn clear_cache(&mut self) {
-        self.capacity_cache.clear();
-        self.overlap_cache.clear();
+        self.size_cache.clear();
     }
 }
 
@@ -488,21 +422,15 @@ mod tests {
         let chunk = "12345";
 
         assert_eq!(
-            ChunkCapacity::from(4)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(4).fits(Characters.size(chunk)),
             Ordering::Greater
         );
         assert_eq!(
-            ChunkCapacity::from(5)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(5).fits(Characters.size(chunk)),
             Ordering::Equal
         );
         assert_eq!(
-            ChunkCapacity::from(6)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(6).fits(Characters.size(chunk)),
             Ordering::Less
         );
     }
@@ -512,27 +440,19 @@ mod tests {
         let chunk = "12345";
 
         assert_eq!(
-            ChunkCapacity::from(0..0)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(0..0).fits(Characters.size(chunk)),
             Ordering::Greater
         );
         assert_eq!(
-            ChunkCapacity::from(0..5)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(0..5).fits(Characters.size(chunk)),
             Ordering::Greater
         );
         assert_eq!(
-            ChunkCapacity::from(5..6)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(5..6).fits(Characters.size(chunk)),
             Ordering::Equal
         );
         assert_eq!(
-            ChunkCapacity::from(6..100)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(6..100).fits(Characters.size(chunk)),
             Ordering::Less
         );
     }
@@ -542,21 +462,15 @@ mod tests {
         let chunk = "12345";
 
         assert_eq!(
-            ChunkCapacity::from(0..)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(0..).fits(Characters.size(chunk)),
             Ordering::Equal
         );
         assert_eq!(
-            ChunkCapacity::from(5..)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(5..).fits(Characters.size(chunk)),
             Ordering::Equal
         );
         assert_eq!(
-            ChunkCapacity::from(6..)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(6..).fits(Characters.size(chunk)),
             Ordering::Less
         );
     }
@@ -566,9 +480,7 @@ mod tests {
         let chunk = "12345";
 
         assert_eq!(
-            ChunkCapacity::from(..)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(..).fits(Characters.size(chunk)),
             Ordering::Equal
         );
     }
@@ -578,27 +490,19 @@ mod tests {
         let chunk = "12345";
 
         assert_eq!(
-            ChunkCapacity::from(0..=4)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(0..=4).fits(Characters.size(chunk)),
             Ordering::Greater
         );
         assert_eq!(
-            ChunkCapacity::from(5..=6)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(5..=6).fits(Characters.size(chunk)),
             Ordering::Equal
         );
         assert_eq!(
-            ChunkCapacity::from(4..=5)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(4..=5).fits(Characters.size(chunk)),
             Ordering::Equal
         );
         assert_eq!(
-            ChunkCapacity::from(6..=100)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(6..=100).fits(Characters.size(chunk)),
             Ordering::Less
         );
     }
@@ -608,21 +512,15 @@ mod tests {
         let chunk = "12345";
 
         assert_eq!(
-            ChunkCapacity::from(..0)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(..0).fits(Characters.size(chunk)),
             Ordering::Greater
         );
         assert_eq!(
-            ChunkCapacity::from(..5)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(..5).fits(Characters.size(chunk)),
             Ordering::Greater
         );
         assert_eq!(
-            ChunkCapacity::from(..6)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(..6).fits(Characters.size(chunk)),
             Ordering::Equal
         );
     }
@@ -632,21 +530,15 @@ mod tests {
         let chunk = "12345";
 
         assert_eq!(
-            ChunkCapacity::from(..=4)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(..=4).fits(Characters.size(chunk)),
             Ordering::Greater
         );
         assert_eq!(
-            ChunkCapacity::from(..=5)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(..=5).fits(Characters.size(chunk)),
             Ordering::Equal
         );
         assert_eq!(
-            ChunkCapacity::from(..=6)
-                .chunk_size(Characters.size(chunk))
-                .fits,
+            ChunkCapacity::from(..=6).fits(Characters.size(chunk)),
             Ordering::Equal
         );
     }
@@ -666,58 +558,43 @@ mod tests {
 
     #[test]
     fn memoized_sizer_only_calculates_once_per_text() {
-        let chunk_config = ChunkConfig::new(10).with_sizer(CountingSizer::default());
-        let mut memoized_sizer = MemoizedChunkSizer::new(&chunk_config, Trim::All);
+        let sizer = CountingSizer::default();
+        let mut memoized_sizer = MemoizedChunkSizer::new(&sizer);
         let text = "1234567890";
         for _ in 0..10 {
-            memoized_sizer.chunk_size(0, text, false);
+            memoized_sizer.chunk_size(0, text, Trim::All);
         }
 
-        assert_eq!(
-            memoized_sizer
-                .chunk_config
-                .sizer()
-                .calls
-                .load(atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(memoized_sizer.sizer.calls.load(atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
     fn memoized_sizer_calculates_once_per_different_text() {
-        let chunk_config = ChunkConfig::new(10).with_sizer(CountingSizer::default());
-        let mut memoized_sizer = MemoizedChunkSizer::new(&chunk_config, Trim::All);
+        let sizer = CountingSizer::default();
+        let mut memoized_sizer = MemoizedChunkSizer::new(&sizer);
         let text = "1234567890";
         for i in 0..10 {
-            memoized_sizer.chunk_size(0, text.get(0..i).unwrap(), false);
+            memoized_sizer.chunk_size(0, text.get(0..i).unwrap(), Trim::All);
         }
 
         assert_eq!(
-            memoized_sizer
-                .chunk_config
-                .sizer()
-                .calls
-                .load(atomic::Ordering::SeqCst),
+            memoized_sizer.sizer.calls.load(atomic::Ordering::SeqCst),
             10
         );
     }
 
     #[test]
     fn can_clear_cache_on_memoized_sizer() {
-        let chunk_config = ChunkConfig::new(10).with_sizer(CountingSizer::default());
-        let mut memoized_sizer = MemoizedChunkSizer::new(&chunk_config, Trim::All);
+        let sizer = CountingSizer::default();
+        let mut memoized_sizer = MemoizedChunkSizer::new(&sizer);
         let text = "1234567890";
         for _ in 0..10 {
-            memoized_sizer.chunk_size(0, text, false);
+            memoized_sizer.chunk_size(0, text, Trim::All);
             memoized_sizer.clear_cache();
         }
 
         assert_eq!(
-            memoized_sizer
-                .chunk_config
-                .sizer()
-                .calls
-                .load(atomic::Ordering::SeqCst),
+            memoized_sizer.sizer.calls.load(atomic::Ordering::SeqCst),
             10
         );
     }

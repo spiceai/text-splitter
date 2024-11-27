@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.18.1
+
+### What's New
+
+- Ensure tokenizer sizers with truncation parameters count their overflow encodings
+
+## v0.18.0
+
+### Breaking
+
+- Change supported `tiktoken-rs` version to `0.6.x`
+
+## v0.17.1
+
+### What's New
+
+- Loosen `regex` crate version requirement
+
+## v0.17.0
+
+### Breaking Changes
+
+- Support `tree-sitter@v0.24` for CodeSplitters.
+- Due to a slight change in the backing unicode segmentation implementation, there are some slight shifts in behavior for CodeSplitters as well (in my tests, mostly that semicolons have a more logical grouping with previous content).
+
 ## v0.16.1
 
 ### What's New

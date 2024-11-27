@@ -5,11 +5,7 @@ use itertools::Itertools;
 use strum::IntoEnumIterator;
 
 use self::fallback::FallbackLevel;
-use crate::{
-    chunk_size::{ChunkSize, MemoizedChunkSizer},
-    trim::Trim,
-    ChunkConfig, ChunkSizer,
-};
+use crate::{chunk_size::MemoizedChunkSizer, trim::Trim, ChunkCapacity, ChunkConfig, ChunkSizer};
 
 #[cfg(feature = "code")]
 mod code;
@@ -234,22 +230,26 @@ where
     Sizer: ChunkSizer,
     Level: SemanticLevel,
 {
-    /// Chunk configuration for this iterator
-    chunk_config: &'sizer ChunkConfig<Sizer>,
+    /// Overal capacity of the chunk
+    capacity: ChunkCapacity,
     /// How to validate chunk sizes
     chunk_sizer: MemoizedChunkSizer<'sizer, Sizer>,
+    /// Average number of sections in a chunk for each level
+    chunk_stats: ChunkStats,
     /// Current byte offset in the `text`
     cursor: usize,
     /// Reusable container for next sections to avoid extra allocations
     next_sections: Vec<(usize, &'text str)>,
+    /// Overlap capacity
+    overlap: ChunkCapacity,
     /// Previous item's end byte offset
     prev_item_end: usize,
     /// Splitter used for determining semantic levels.
     semantic_split: SemanticSplitRanges<Level>,
     /// Original text to iterate over and generate chunks from
     text: &'text str,
-    /// Average number of sections in a chunk for each level
-    chunk_stats: ChunkStats,
+    /// The trimming method to apply
+    trim: Trim,
 }
 
 impl<'sizer, 'text: 'sizer, Sizer, Level> TextChunks<'text, 'sizer, Sizer, Level>
@@ -265,15 +265,23 @@ where
         offsets: Vec<(Level, Range<usize>)>,
         trim: Trim,
     ) -> Self {
+        let ChunkConfig {
+            capacity,
+            overlap,
+            sizer,
+            trim: trim_enabled,
+        } = chunk_config;
         Self {
-            chunk_config,
-            chunk_sizer: MemoizedChunkSizer::new(chunk_config, trim),
+            capacity: *capacity,
+            chunk_sizer: MemoizedChunkSizer::new(sizer),
+            chunk_stats: ChunkStats::new(),
             cursor: 0,
             next_sections: Vec::new(),
+            overlap: (*overlap).into(),
             prev_item_end: 0,
             semantic_split: SemanticSplitRanges::new(offsets),
             text,
-            chunk_stats: ChunkStats::new(),
+            trim: if *trim_enabled { trim } else { Trim::None },
         }
     }
 
@@ -281,22 +289,19 @@ where
     /// Returns final byte offset and str.
     /// Will return `None` if given an invalid range.
     fn next_chunk(&mut self) -> Option<(usize, &'text str)> {
-        // Reset caches so we can reuse the memory allocation
-        self.chunk_sizer.clear_cache();
         self.semantic_split.update_cursor(self.cursor);
         let low = self.update_next_sections();
-
         let (start, end) = self.binary_search_next_chunk(low)?;
+        let chunk = self.text.get(start..end)?;
+        self.chunk_stats.update_max_chunk_size(end - start);
 
+        // Reset caches so we can reuse the memory allocation
+        self.chunk_sizer.clear_cache();
         // Optionally move cursor back if overlap is desired
         self.update_cursor(end);
 
-        let chunk = self.text.get(start..end)?;
-
-        self.chunk_stats.update_max_chunk_size(end - start);
-
         // Trim whitespace if user requested it
-        Some(self.chunk_sizer.trim_chunk(start, chunk))
+        Some(self.trim.trim(start, chunk))
     }
 
     /// Use binary search to find the next chunk that fits within the chunk size
@@ -313,9 +318,10 @@ where
             let (offset, str) = self.next_sections[mid];
             let text_end = offset + str.len();
             let chunk = self.text.get(start..text_end)?;
-            let chunk_size = self.chunk_sizer.check_capacity(start, chunk, false);
+            let chunk_size = self.chunk_sizer.chunk_size(start, chunk, self.trim);
+            let fits = self.capacity.fits(chunk_size);
 
-            match chunk_size.fits() {
+            match fits {
                 Ordering::Less => {
                     // We got further than the last one, so update end
                     if text_end > end {
@@ -344,7 +350,7 @@ where
             };
 
             // Adjust search area
-            if chunk_size.fits().is_lt() {
+            if fits.is_lt() {
                 low = mid + 1;
             } else if mid > 0 {
                 high = mid - 1;
@@ -365,8 +371,8 @@ where
                 let (offset, str) = self.next_sections[index];
                 let text_end = offset + str.len();
                 let chunk = self.text.get(start..text_end)?;
-                let size = self.chunk_sizer.check_capacity(start, chunk, false);
-                if size.size() <= chunk_size.size() {
+                let size = self.chunk_sizer.chunk_size(start, chunk, self.trim);
+                if size <= chunk_size {
                     if text_end > end {
                         end = text_end;
                     }
@@ -382,7 +388,7 @@ where
     /// Use binary search to find the sections that fit within the overlap size.
     /// If no overlap deisired, return end.
     fn update_cursor(&mut self, end: usize) {
-        if self.chunk_config.overlap() == 0 {
+        if self.overlap.max == 0 {
             self.cursor = end;
             return;
         }
@@ -401,19 +407,20 @@ where
         while low <= high {
             let mid = low + (high - low) / 2;
             let (offset, _) = self.next_sections[mid];
-            let chunk_size = self.chunk_sizer.check_capacity(
+            let chunk_size = self.chunk_sizer.chunk_size(
                 offset,
                 self.text.get(offset..end).expect("Invalid range"),
-                true,
+                self.trim,
             );
+            let fits = self.overlap.fits(chunk_size);
 
             // We got further than the last one, so update start
-            if chunk_size.fits().is_le() && offset < start && offset > self.cursor {
+            if fits.is_le() && offset < start && offset > self.cursor {
                 start = offset;
             }
 
             // Adjust search area
-            if chunk_size.fits().is_lt() && mid > 0 {
+            if fits.is_lt() && mid > 0 {
                 high = mid - 1;
             } else {
                 low = mid + 1;
@@ -426,6 +433,7 @@ where
     /// Find the ideal next sections, breaking it up until we find the largest chunk.
     /// Increasing length of chunk until we find biggest size to minimize validation time
     /// on huge chunks
+    #[allow(clippy::too_many_lines)]
     fn update_next_sections(&mut self) -> usize {
         // First thing, clear out the list, but reuse the allocated memory
         self.next_sections.clear();
@@ -434,6 +442,7 @@ where
 
         let (semantic_level, mut max_offset) = self.chunk_sizer.find_correct_level(
             self.cursor,
+            &self.capacity,
             self.semantic_split
                 .levels_in_remaining_text(self.cursor)
                 .filter_map(|level| {
@@ -442,6 +451,7 @@ where
                         .next()
                         .map(|(_, str)| (level, str))
                 }),
+            self.trim,
         );
 
         let sections = if let Some(semantic_level) = semantic_level {
@@ -453,12 +463,14 @@ where
         } else {
             let (semantic_level, fallback_max_offset) = self.chunk_sizer.find_correct_level(
                 self.cursor,
+                &self.capacity,
                 FallbackLevel::iter().filter_map(|level| {
                     level
                         .sections(remaining_text)
                         .next()
                         .map(|(_, str)| (level, str))
                 }),
+                self.trim,
             );
 
             max_offset = match (fallback_max_offset, max_offset) {
@@ -482,8 +494,8 @@ where
         // Start filling up the next sections. Since calculating the size of the chunk gets more expensive
         // the farther we go, we conservatively check for a smaller range to do the later binary search in.
         let mut low = 0;
-        let mut prev_equals: Option<ChunkSize> = None;
-        let max = self.chunk_config.capacity().max();
+        let mut prev_equals: Option<usize> = None;
+        let max = self.capacity.max;
         let mut target_offset = self.chunk_stats.max_chunk_size.unwrap_or(max);
 
         loop {
@@ -503,19 +515,19 @@ where
             // Check if the last item fits
             if let Some(&(offset, str)) = self.next_sections.last() {
                 let text_end = offset + str.len();
-                if text_end < target_offset {
+                if (text_end - self.cursor) < target_offset {
                     break;
                 }
-                let chunk_size = self.chunk_sizer.check_capacity(
+                let chunk_size = self.chunk_sizer.chunk_size(
                     offset,
                     self.text.get(self.cursor..text_end).expect("Invalid range"),
-                    false,
+                    self.trim,
                 );
+                let fits = self.capacity.fits(chunk_size);
 
-                let fits = chunk_size.fits();
                 if fits.is_le() {
                     let final_offset = offset + str.len() - self.cursor;
-                    let size = chunk_size.size().max(1);
+                    let size = chunk_size.max(1);
                     let diff = (max - size).max(1);
                     let avg_size = final_offset.div_ceil(size);
 
@@ -534,7 +546,7 @@ where
                         // Don't update low because it could be a range
                         // If we've seen a previous equals, we can break if the size is bigger already
                         if let Some(prev) = prev_equals {
-                            if prev.size() < chunk_size.size() {
+                            if prev < chunk_size {
                                 break;
                             }
                         }
